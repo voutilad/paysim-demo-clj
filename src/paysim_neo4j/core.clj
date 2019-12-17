@@ -1,7 +1,10 @@
 (ns paysim-neo4j.core
+  (:require [clojure.pprint :as pp])
   (:import (org.paysim IteratingPaySim)
            (org.paysim.parameters Parameters)
            (org.neo4j.driver AuthTokens
+                             Config
+                             Config$TrustStrategy
                              Driver
                              GraphDatabase
                              Session
@@ -11,14 +14,21 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Neo4j stuff
 
-(def db-config {:uri "bolt://localhost:7687"
+(def db-config {:uri "bolt://localhost:443"
                 :username "neo4j"
                 :password "password"})
+
+(def strategy (Config$TrustStrategy/trustAllCertificates))
+
+(def cfg (-> (Config/builder)
+              (.withEncryption)
+              ;(.withTrustStrategy strategy)
+              (.build)))
 
 (defn connect!
   "Establish a Bolt connection to a Neo4j instance, returning a Driver."
   [{:keys [uri username password]}]
-  (GraphDatabase/driver uri (AuthTokens/basic username password)))
+  (GraphDatabase/driver uri (AuthTokens/basic username password) cfg))
 
 (defn compose-query
   "Compose a Cypher Query that's passable to an open Session for execution."
@@ -53,14 +63,18 @@
   (hash-map :step (.getStep t)
             :action (.getAction t)
             :amount (.getAmount t)
-            :source (.getNameOrig t)
-            :source-type (str (.getOrigType t))
-            :source-balance (.getNewBalanceOrig t)
-            :dest (.getNameDest t)
-            :dest-type (str (.getDestType t))
-            :dest-balance (.getNewBalanceDest t)))
+            :fraud (.isFraud t)
+            :flagged-fraud (.isFlaggedFraud t)
+            :source (hash-map :name (.getNameOrig t)
+                              :type (str (.getOrigType t))
+                              :balance (.getNewBalanceOrig t))
+            :dest (hash-map :name (.getNameDest t)
+                            :type (str (.getDestType t))
+                            :balance (.getNewBalanceDest t))))
 
-(def agent-cache (atom #{}))
+
+;; Cache by actor name
+(def agent-cache (atom {}))
 
 (defn match-or-create-agent
   [agent-name agent-type ref-name]
@@ -70,26 +84,15 @@
       (swap! agent-cache conj agent-name)
       (format "CREATE (%s:%s {name: '%s'})" ref-name agent-type agent-name))))
 
-(defn link)
 
 (defn sim-and-load
   [driver params-file]
   (let [params (new Parameters params-file)
         sim (new IteratingPaySim params)]
     (.run sim)
-    (let [txns (take 25 (iterator-seq sim))]
+    (let [txns (eduction (comp (take 5) (map transaction->map)) (iterator-seq sim))]
       (doseq [tx txns]
-        (let [{:keys [step action amount source source-type
-                      source-balance dest dest-type dest-balance]} (transaction->map tx)]
-          (if (not (contains? @agent-cache source))
-            (do (cond (= "CLIENT" source-type) (println "new client" source)
-                      (= "MERCHANT" source-type) (println "new merchant" source))
-                (swap! agent-cache conj source)))
-          (if (not (contains? @agent-cache dest))
-            (do (cond (= "CLIENT" dest-type) (println "new client" dest)
-                      (= "MERCHANT" dest-type) (println "new merchant" dest))
-                (swap! agent-cache conj dest))))))
-    (println "Final: " @agent-cache)
+        (pp/pprint tx)))
     (.abort sim)))
 
 (defn -main
