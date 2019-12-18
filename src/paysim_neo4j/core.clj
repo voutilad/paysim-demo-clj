@@ -62,7 +62,7 @@
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; PaySim stuff
-(def batch-size 20)
+(def batch-size 25)
 (def start-date (time/zoned-date-time 2019 1 1))
 
 (defn transaction->map
@@ -100,7 +100,8 @@
                 "MERGE (r~IDX~:~RTYPE~ { name: $data[~IDX~].receiverName })"
                 "CREATE (tx~IDX~:~XTYPE~ { id: $data[~IDX~].txId })"
                 "  SET tx~IDX~.ts = $data[~IDX~].ts, tx~IDX~.amount = $data[~IDX~].amount, tx~IDX~.fraud = $data[~IDX~].fraud, tx~IDX~.step = $data[~IDX~].step"
-                "CREATE (s~IDX~)-[:SENT_ON_~DATE~]->(tx~IDX~)-[:TO]->(r~IDX~)"]))
+                "CREATE (s~IDX~)-[:SENT_ON_~DATE~]->(tx~IDX~)"
+                "CREATE (tx~IDX~)-[:TO]->(r~IDX~)"]))
 
 (defn build-merge-query
   ([tx] (build-merge-query tx 0))
@@ -120,7 +121,8 @@
         receiverName (:name dest)
         txId (.toString (java.util.UUID/randomUUID))
         ts (step->ts step)]
-    {:amount amount :fraud fraud :senderName senderName :receiverName receiverName :txId txId :ts ts}))
+    {:amount amount :fraud fraud :senderName senderName :receiverName receiverName
+     :txId txId :ts ts :step step}))
 
 (defn naive-query
   "Generate a naive Neo4j query to populate the labels and relationships from a Transaction"
@@ -142,17 +144,27 @@
         sim (new IteratingPaySim params)]
     (.run sim)
     (let [cnt (volatile! 0)
+          clock (volatile! (System/currentTimeMillis))
           batches (eduction transducer-pipeline (iterator-seq sim))]
       (doseq [batch batches]
         (execute! driver (apply naive-query batch))
-        (let [cur (vswap! cnt inc)]
-          (if (= 0 (mod cur 1))
-            (println (format "...batch %d (%d txns)" cur (* cur batch-size)))))))
+        (let [cur (vswap! cnt inc)
+              log-interval 100]
+          (if (= 0 (mod cur log-interval))
+            (let [start @clock
+                  finish (vreset! clock (System/currentTimeMillis))
+                  delta-s (/ (- finish start) 1000)]
+              (println (format "%d\t%d\t%f\t%f"
+                               cur
+                               (* cur batch-size)
+                               (double delta-s)
+                               (double (/ (* log-interval batch-size) delta-s)))))))))
     (try (.abort sim))))
 
 (defn -main
   "Simulate and load into Neo4j"
   [& args]
   (with-open [driver (connect! db-config)]
-    (map #(execute! driver %) init-schema-queries)
+    (doseq [q init-schema-queries]
+      (execute! driver q))
     (sim-and-load driver "PaySim.properties")))
