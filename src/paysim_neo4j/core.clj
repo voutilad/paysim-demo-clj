@@ -1,5 +1,7 @@
 (ns paysim-neo4j.core
-  (:require [clojure.pprint :as pp])
+  (:require [clojure.pprint :as pp]
+            [clojure.string :as s]
+            [java-time :as time])
   (:import (org.paysim IteratingPaySim)
            (org.paysim.parameters Parameters)
            (org.neo4j.driver AuthTokens
@@ -14,14 +16,14 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Neo4j stuff
 
-(def db-config {:uri "bolt://localhost:443"
+(def db-config {:uri "bolt://localhost:7687"
                 :username "neo4j"
                 :password "password"})
 
 (def strategy (Config$TrustStrategy/trustAllCertificates))
 
 (def cfg (-> (Config/builder)
-              (.withEncryption)
+              ;(.withEncryption)
               ;(.withTrustStrategy strategy)
               (.build)))
 
@@ -51,52 +53,105 @@
 (def init-schema-queries
   (map compose-query ["CREATE CONSTRAINT ON (c:Client) ASSERT c.name IS UNIQUE"
                       "CREATE CONSTRAINT ON (b:Bank) ASSERT b.name IS UNIQUE"
-                      "CREATE CONSTRAINT ON (m:Merchant) ASSERT m.name IS UNIQUE"]))
+                      "CREATE CONSTRAINT ON (m:Merchant) ASSERT m.name IS UNIQUE"
+                      "CREATE CONSTRAINT ON (c:CashIn) ASSERT c.id IS UNIQUE"
+                      "CREATE CONSTRAINT ON (c:CashOut) ASSERT c.id IS UNIQUE"
+                      "CREATE CONSTRAINT ON (d:Debit) ASSERT d.id IS UNIQUE"
+                      "CREATE CONSTRAINT ON (p:Payment) ASSERT p.id IS UNIQUE"
+                      "CREATE CONSTRAINT ON (t:Transfer) ASSERT t.id IS UNIQUE"]))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; PaySim stuff
-
-(def batch-size 500)
+(def batch-size 20)
+(def start-date (time/zoned-date-time 2019 1 1))
 
 (defn transaction->map
   [t]
-  (hash-map :step (.getStep t)
-            :action (.getAction t)
-            :amount (.getAmount t)
-            :fraud (.isFraud t)
-            :flagged-fraud (.isFlaggedFraud t)
-            :source (hash-map :name (.getNameOrig t)
-                              :type (str (.getOrigType t))
-                              :balance (.getNewBalanceOrig t))
-            :dest (hash-map :name (.getNameDest t)
-                            :type (str (.getDestType t))
-                            :balance (.getNewBalanceDest t))))
+  (if (nil? t) {}
+      (hash-map :step (.getStep t)
+                :action (.getAction t)
+                :amount (.getAmount t)
+                :fraud (.isFraud t)
+                :flagged-fraud (.isFlaggedFraud t)
+                :source (hash-map :name (.getNameOrig t)
+                                  :type (str (.getOrigType t))
+                                  :balance (.getNewBalanceOrig t))
+                :dest (hash-map :name (.getNameDest t)
+                                :type (str (.getDestType t))
+                                :balance (.getNewBalanceDest t)))))
 
+(defn tx->label
+  "Convert a transaction type to a proper label"
+  [tx]
+  (let [{:keys [action]} tx]
+    (s/join "" (map s/capitalize (s/split action #"_")))))
 
-;; Cache by actor name
-(def agent-cache (atom {}))
+(defn step->ts
+  [step]
+  (time/plus start-date (time/hours step)))
 
-(defn match-or-create-agent
-  [agent-name agent-type ref-name]
-  (if (contains? @agent-cache agent-name)
-    (format "MATCH (%s:%s {name: '%s'})" ref-name agent-type agent-name)
-    (do
-      (swap! agent-cache conj agent-name)
-      (format "CREATE (%s:%s {name: '%s'})" ref-name agent-type agent-name))))
+(defn ts->daystring
+  "Generate a localized date string from a timestamp"
+  [ts]
+  (time/format "YYYY_MM_dd" ts))
 
+(def query-pattern
+  (s/join "\n" ["MERGE (s~IDX~:~STYPE~ { name: $data[~IDX~].senderName })"
+                "MERGE (r~IDX~:~RTYPE~ { name: $data[~IDX~].receiverName })"
+                "CREATE (tx~IDX~:~XTYPE~ { id: $data[~IDX~].txId })"
+                "  SET tx~IDX~.ts = $data[~IDX~].ts, tx~IDX~.amount = $data[~IDX~].amount, tx~IDX~.fraud = $data[~IDX~].fraud, tx~IDX~.step = $data[~IDX~].step"
+                "CREATE (s~IDX~)-[:SENT_ON_~DATE~]->(tx~IDX~)-[:TO]->(r~IDX~)"]))
+
+(defn build-merge-query
+  ([tx] (build-merge-query tx 0))
+  ([tx idx]
+   (let [{:keys [amount source dest step]} tx]
+     (-> query-pattern
+         (s/replace #"~IDX~" (str idx))
+         (s/replace #"~STYPE~" (s/capitalize (:type source)))
+         (s/replace #"~RTYPE~" (s/capitalize (:type dest)))
+         (s/replace #"~XTYPE~" (tx->label tx))
+         (s/replace #"~DATE~" (ts->daystring (step->ts step)))))))
+
+(defn tx->props
+  [tx]
+  (let [{:keys [amount dest fraud source step]} tx
+        senderName (:name source)
+        receiverName (:name dest)
+        txId (.toString (java.util.UUID/randomUUID))
+        ts (step->ts step)]
+    {:amount amount :fraud fraud :senderName senderName :receiverName receiverName :txId txId :ts ts}))
+
+(defn naive-query
+  "Generate a naive Neo4j query to populate the labels and relationships from a Transaction"
+  ([tx & txs]
+   (let [all (cons tx txs)
+         idxs (range (count all))
+         query (s/join "\n\n" (map (fn [[k v]] (build-merge-query v k)) (zipmap idxs all)))
+         data (map tx->props all)]
+     (compose-query query {:data data}))))
+
+(def transducer-pipeline
+  (comp (map transaction->map)
+        (partition-all batch-size)))
 
 (defn sim-and-load
+  "Step through an IteratingPaySim, loading data as we go"
   [driver params-file]
   (let [params (new Parameters params-file)
         sim (new IteratingPaySim params)]
     (.run sim)
-    (let [txns (eduction (comp (take 5) (map transaction->map)) (iterator-seq sim))]
-      (doseq [tx txns]
-        (pp/pprint tx)))
-    (.abort sim)))
+    (let [cnt (volatile! 0)
+          batches (eduction transducer-pipeline (iterator-seq sim))]
+      (doseq [batch batches]
+        (execute! driver (apply naive-query batch))
+        (let [cur (vswap! cnt inc)]
+          (if (= 0 (mod cur 1))
+            (println (format "...batch %d (%d txns)" cur (* cur batch-size)))))))
+    (try (.abort sim))))
 
 (defn -main
-  "I don't do a whole lot ... yet."
+  "Simulate and load into Neo4j"
   [& args]
   (with-open [driver (connect! db-config)]
     (map #(execute! driver %) init-schema-queries)
