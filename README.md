@@ -42,17 +42,6 @@ in a self-contained driver that populates a target Neo4j
 database. I've essentially done the heavy lifting for you to go from
 zero to graph in minutes.
 
-You'll need:
-
-- Java JRE 8 or 11
-  - No idea where to get it? https://adoptopenjdk.net/
-- Neo4j 3.5
-  - Grab either Neo4j Desktop (https://neo4j.com/download/)
-  - Use a fully managed instance in Aura (https://console.neo4j.io)
-  - Or find whatever suits you on https://neo4j.com/download-center/
-- The latest release jar:
-  https://github.com/voutilad/paysim-demo/releases
-
 ### Wait, what's Neo4j?
 
 The world's most flexible, reliable, and developer friendly native
@@ -71,14 +60,22 @@ check out this talk from Jennifer Reif:
 ## Installation
 
 While the project depends on a few other[2] Java projects, it's
-designed to be standalone in terms of installation and usage.
+designed to be standalone in terms of installation and usage. You'll
+need to build from source, however. (See the Licensing section for
+details why.)
+
+Make sure you get and install:
+
+- A recent JDK 11 (I haven't tested 8) - https://adoptopenjdk.net
+- Neo4j 3.5 - https://neo4j.com/download
+- Leiningen - https://leiningen.org/
 
 ### Building from Source
 
 1. You'll need a recent version of [Leiningen](https://leiningen.org/)
 2. Either clone this project or grab a source release
-3. Since the paysim dependency isn't published publicly (yet), install
-   it locally by running (from the project root directory):
+3. Since the PaySim dependency isn't published in a public repo,
+   install it locally by running:
    ```sh
    $ lein deploy local-paysim-jar org.paysim/paysim 2.0-voutilad-5 ./lib/paysim-2.0-voutilad-5.jar
    ```
@@ -86,19 +83,10 @@ designed to be standalone in terms of installation and usage.
    ```sh
    $ lein uberjar
    ```
-5. You should now be able to run the demo via:
+5. You should now be able to run the simulation demo via:
    ```sh
-   $ java jar ./target/uberjar/paysim-neo4j-0.1.0-SNAPSHOT-standalone.jar
+   $ java jar ./target/uberjar/paysim-neo4j-0.1.0-standalone.jar
    ```
-
-### Installing from a Prebuilt Uberjar
-
-The one major caveat inherited from the
-[PaySim](https://github.com/voutilad/paysim) dependency is the
-`PaySim.properties` file and the "param files" must be in the current
-directory from which you run the demo. The files are bundled with the
-source and should also come with any distribution (zip file) of the
-uberjar.
 
 ## Usage
 
@@ -139,6 +127,22 @@ GLOBAL OPTIONS:
 - There are some known synchronization points currently, specifically
   for some logging output to stdout. I haven't profiled the code at
   all, so I know it could be faster.
+
+## License
+
+The original PaySim project is licensed under GPLv3 without a
+classpath exception, so this work that distributes it in the provided
+jar (in `./lib`) is currently considered a GPLv3 work.
+
+This does pose some difficulties, namely incompatability with the
+EPLv1 and EPLv2 licenses, of which Clojure and most of the Clojure
+ecosystem use.
+
+As such, this project exists in a horrible edge-case where neither you
+nor I can redistribute a fully bundled work including the Clojure
+runtime and PaySim. ¯\_(ツ)_/¯ (AFAIK only the code can be shared.)
+
+An explanation: https://youtu.be/UqcONoahlmQ?t=9
 
 ## Footnotes
 

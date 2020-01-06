@@ -16,30 +16,38 @@
   (:gen-class))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
 ;; Neo4j stuff
-
-(def db-config {:uri "bolt://localhost:7687"
-                :username "neo4j"
-                :password "password"})
 
 (def init-schema-queries
   (map db/compose-query ["CREATE CONSTRAINT ON (c:Client) ASSERT c.name IS UNIQUE"
+                         "CREATE CONSTRAINT ON (m:Mule) ASSERT m.name IS UNIQUE"
                          "CREATE CONSTRAINT ON (b:Bank) ASSERT b.name IS UNIQUE"
                          "CREATE CONSTRAINT ON (m:Merchant) ASSERT m.name IS UNIQUE"
                          "CREATE CONSTRAINT ON (c:CashIn) ASSERT c.id IS UNIQUE"
                          "CREATE CONSTRAINT ON (c:CashOut) ASSERT c.id IS UNIQUE"
                          "CREATE CONSTRAINT ON (d:Debit) ASSERT d.id IS UNIQUE"
                          "CREATE CONSTRAINT ON (p:Payment) ASSERT p.id IS UNIQUE"
-                         "CREATE CONSTRAINT ON (t:Transfer) ASSERT t.id IS UNIQUE"]))
+                         "CREATE CONSTRAINT ON (t:Transfer) ASSERT t.id IS UNIQUE"
+                         "CREATE CONSTRAINT ON (tx:Transaction) ASSERT tx.id IS UNIQUE"
+                         "CREATE INDEX ON :Transaction(globalStep)"
+                         "CREATE INDEX ON :CashIn(globalStep)"
+                         "CREATE INDEX ON :CashOut(globalStep)"
+                         "CREATE INDEX ON :Debit(globalStep)"
+                         "CREATE INDEX ON :Payment(globalStep)"
+                         "CREATE INDEX ON :Transfer(globalStep)"]))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; PaySim stuff
+;;
+;; PaySim wrapper and processing stuff
+
 (def start-date (time/zoned-date-time 2019 10 1))
 
 (defn transaction->map
   [t]
   (if (nil? t) nil
       (hash-map :step (.getStep t)
+                :global-step (.getGlobalStep t)
                 :action (.getAction t)
                 :amount (.getAmount t)
                 :fraud (.isFraud t)
@@ -51,7 +59,7 @@
                                 :type (str (.getDestType t))
                                 :balance (.getNewBalanceDest t)))))
 
-(def tx-keys #{:step :action :amount :fraud :flagged-fraud :source :dest})
+(def tx-keys #{:global-step :step :action :amount :fraud :flagged-fraud :source :dest})
 (defn tx?
   [tx]
   (and (some? tx)
@@ -78,10 +86,27 @@
 (def query-pattern
   (s/join "\n" ["MERGE (s:~STYPE~ { name: $senderName })"
                 "MERGE (r:~RTYPE~ { name: $receiverName })"
-                "CREATE (tx:~XTYPE~ { id: $txId })"
-                "SET tx.ts = $ts, tx.amount = $amount, tx.fraud = $fraud, tx.step = $step"
-                "CREATE (s)-[:SENT_ON_~DATE~]->(tx)"
+                "CREATE (tx:Transaction:~XTYPE~ { id: $txId })"
+                "SET tx.ts = $ts, tx.amount = $amount, tx.fraud = $fraud,"
+                "    tx.step = $step, tx.globalStep = $globalStep"
+                "CREATE (s)-[:PERFORMED]->(tx)"
                 "CREATE (tx)-[:TO]->(r)"]))
+
+(def threading-query-pattern
+  "
+UNWIND $rows AS row
+  MATCH (c:Client {name: row.name})-[:PERFORMED]->(tx:Transaction)-[:TO]-() WHERE NOT (c)-[:FIRST_TX]->()
+  WITH c, collect(tx) AS txs
+  WITH c, txs, head(txs) AS _start, last(txs) AS _last
+
+  MERGE (c)-[:FIRST_TX]->(_start)
+  MERGE (c)-[:LAST_TX]->(_last)
+  WITH c, apoc.coll.pairsMin(txs) AS pairs
+
+  UNWIND pairs AS pair
+    WITH pair[0] AS a, pair[1] AS b
+    MERGE (a)-[n:NEXT]->(b)
+    RETURN COUNT(n)")
 
 (defn build-merge-query
   [tx]
@@ -90,18 +115,21 @@
         (s/replace #"~STYPE~" (s/capitalize (:type source)))
         (s/replace #"~RTYPE~" (s/capitalize (:type dest)))
         (s/replace #"~XTYPE~" (tx->label tx))
-        (s/replace #"~DATE~" (ts->daystring (step->ts step))))))
+        ;(s/replace #"~DATE~" (ts->daystring (step->ts step)))
+        )))
 
 (defn tx->props
+  "Convert a transaction to a map of properties"
   [tx]
-  (let [{:keys [amount dest fraud flagged-fraud source step]} tx
+  (let [{:keys [amount dest fraud flagged-fraud source step global-step]} tx
         senderName (:name source)
         receiverName (:name dest)
         txId (.toString (java.util.UUID/randomUUID))
         ts (step->ts step)]
     {:amount amount :fraud fraud :flagged-fraud flagged-fraud
      :senderName senderName :receiverName receiverName
-     :txId txId :ts ts :step step}))
+     :txId txId :ts ts
+     :step step :globalStep global-step}))
 
 (defn naive-query
   "Generate a naive Neo4j query to populate the labels and relationships from a Transaction"
@@ -111,51 +139,65 @@
      (db/compose-query query props))))
 
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; Simulation Routines and Settings
+;;
 
-
-;;;;;;;;
+;; Somewhat arbitrarily chosen...not really optimized.
 (def default-batch-size 1000)
-(def default-log-interval 100)
 (def default-sim-queue-depth 100000)
 
 (def transducer-pipeline
-  (comp (map transaction->map)
-        (filter tx?)
-        (partition-all default-batch-size)))
+  (comp (map transaction->map)               ; convert to a clj map
+        (filter tx?)                         ; filter non-compliant data
+        (partition-all default-batch-size))) ; partition the stream into batches
 
-(defn sim-and-load
+(defn sim-and-load!
   "Step through an IteratingPaySim, loading data as we go"
   [driver params-file]
   (let [params (new Parameters params-file)
         sim (new IteratingPaySim params default-sim-queue-depth)]
     (.run sim)
-    (let [cnt (volatile! 0)
-          batch-size default-batch-size
-          clock (volatile! (System/currentTimeMillis))
-          batches (eduction transducer-pipeline (iterator-seq sim))]
+    (let [batches (eduction transducer-pipeline (iterator-seq sim))]
       (doseq [batch batches]
-        (apply db/write! driver (map naive-query batch))
-        (let [cur (vswap! cnt inc)
-              log-interval default-log-interval]
-          (if (= 0 (mod cur log-interval))
-            (let [start @clock
-                  finish (vreset! clock (System/currentTimeMillis))
-                  delta-s (/ (- finish start) 1000)]
-              (println (format "%d\t%d\t%f\t%f"
-                               cur
-                               (* cur batch-size)
-                               (double delta-s)
-                               (double (/ (* log-interval batch-size) delta-s)))))))))
+        (apply db/write! driver (map naive-query batch))))
     (try (.abort sim) (catch Exception e))))
 
-;;;;;;;;;;;;;;;;;;
+(defn get-client-names!
+  "Get all names of clients known in our database. For default settings, it's ~20k."
+  [session]
+  (let [tx (comp (map #(.asMap %))
+                 (map #(hash-map :name (get % "c.name"))))
+        result (.run session "MATCH (c:Client) RETURN c.name")]
+    (transduce tx conj (iterator-seq result))))
+
+(defn thread-transactions!
+  "String all the transaction events together temporally in a chain"
+  [driver]
+  (with-open [session (.session driver)]
+    ;; First make sure our Mules are also Clients...it's a data issue
+    (.run session "MATCH (m:Mule) SET m :Client RETURN m.name")
+    ;; Batch iterate over the client names, threading them in groups
+    (let [client-names (get-client-names! session)]
+      (doseq [batch (partition-all 1000 client-names)]
+        (let [query (db/compose-query threading-query-pattern {:rows (vec batch)})]
+          (.writeTransaction session (db/single-query-txn query)))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; Main routines and CLI config
+
 (defn run-sim!
   [opts]
   (with-open [driver (db/connect! opts)]
     ;; make sure we have a valid schema with constraints
+    (println "Initializing schema constraints...")
     (doseq [q init-schema-queries] (db/execute! driver q))
-    ;; do the heavy lifting
-    (sim-and-load driver "PaySim.properties")))
+    (println "Running simulation and loading data...")
+    (time (sim-and-load! driver "PaySim.properties"))
+    (println "Threading transactions into nice chains...")
+    (time (thread-transactions! driver))))
 
 (def cli-configuration
   {:app {:command "paysim-neo4j"
