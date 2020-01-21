@@ -188,6 +188,12 @@ UNWIND $rows AS row
 ;;
 ;; Main routines and CLI config
 
+(defn run-threading!
+  [opts]
+  (with-open [driver (db/connect! opts)]
+    (println "Threading transactions into nice chains...")
+    (time (thread-transactions! driver))))
+
 (defn run-sim!
   [opts]
   (with-open [driver (db/connect! opts)]
@@ -226,8 +232,11 @@ UNWIND $rows AS row
                   :type :flag
                   :default false}]
    :commands [{:command "run"
-               :description "Run the simulation and load the data."
-               :runs run-sim!}]})
+               :description "Run all tasks: init schema, simulate/load transactions,  and thread them."
+               :runs run-sim!}
+              {:command "thread"
+               :description "Thread existing transactions based on global step counter"
+               :runs run-threading!}]})
 
 (defn -main
   "Simulate and load into Neo4j"

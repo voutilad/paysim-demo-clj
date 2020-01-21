@@ -38,7 +38,7 @@
    {:pre [(string? query)
           (map? m)]}
    (Query. query (clojure.walk/stringify-keys m))))
-9
+
 (defn single-query-txn
   "Run a single `query` in a unit of TransactionWork"
   [query]
@@ -61,7 +61,7 @@
     (.run session query)))
 
 (defn write!
-  "Execute one or many writing transaction `stmt`s in a session using the provided `driver` instance."
+  "Execute one or many writing transaction `query`s in a session using the provided `driver` instance."
   ([driver query]
    {:pre [(instance? Driver driver)]}
    (with-open [session (.session driver)]
